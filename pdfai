@@ -1,0 +1,90 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use feature qw/say/;
+use AI::Categorizer::Collection::Files;
+use AI::Categorizer::Learner::NaiveBayes;
+use AI::Categorizer::KnowledgeSet;
+use Glib::Object::Introspection;
+
+Glib::Object::Introspection->setup (basename => 'Poppler',
+                                    version => '0.18',
+                                    package => 'Poppler');
+
+my $training_dir = $ARGV[0];
+my $testing_dir = $ARGV[1];
+
+say 'Reading training set...';
+my $training_collection = PDFCollection->new (path => $training_dir, recurse => 1);
+my $ks = AI::Categorizer::KnowledgeSet->new (verbose => 1);
+$ks->load (collection => $training_collection);
+
+say 'Training learner...';
+my $l = AI::Categorizer::Learner::NaiveBayes->new (verbose => 2);
+$l->train (knowledge_set => $ks);
+
+say 'Categorizing test set';
+my $testing_collection = PDFCollection->new (path => $testing_dir, recurse => 1);
+my $experiment = $l->categorize_collection (collection => $testing_collection);
+print $experiment->stats_table;
+
+# ---------------------------------------------------------------------------- #
+
+package PDFDocument;
+
+use strict;
+use warnings;
+use base qw/AI::Categorizer::Document/;
+
+sub read {
+  my ($class, %args) = @_;
+  my $path = delete $args{path} or die "Must specify 'path' argument to read()";
+
+  my $self = $class->new (%args);
+
+  my $doc = Poppler::Document->new_from_file (
+    Glib->filename_to_uri ($path, undef));
+
+  foreach my $p (0 .. ($doc->get_n_pages ()-1)) {
+    my $page = $doc->get_page ($p);
+    my $page_text = $page->get_text ();
+    utf8::encode ($page_text);
+    $self->{content}{body} .= "$page_text\n\n";
+  }
+
+  $self->finish;
+  return $self;
+}
+
+package PDFCollection;
+
+use strict;
+use warnings;
+use File::Basename qw//;
+use base qw/AI::Categorizer::Collection::Files/;
+
+# FIXME
+BEGIN {
+  AI::Categorizer::Collection::Files->contained_objects (
+    document => { class => 'PDFDocument', delayed => 1 },
+  );
+}
+
+sub next {
+  my $self = shift;
+  my $file = $self->_read_file;
+  return unless defined $file;
+
+  my $cats = [];
+  my $basename = File::Basename::basename ($file);
+  if ($basename =~ m/^\d\d\d\d-\d\d-\d\d ([^.]+)\.pdf/i) {
+    push @$cats, AI::Categorizer::Category->by_name (name => $1);
+  }
+
+  return $self->call_method('document', 'read',
+                            path => File::Spec->catfile ($self->{cur_dir}, $file),
+                            name => $file,
+                            categories => $cats);
+}
+
+1;
