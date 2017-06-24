@@ -1,32 +1,136 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
+use utf8;
 use feature qw/say/;
+use DateTime::Format::Natural;
+use File::Temp qw//;
+use List::Util qw/min/;
+use PDF::Extract;
+
 use AI::Categorizer::Collection::Files;
-use AI::Categorizer::Learner::NaiveBayes;
 use AI::Categorizer::KnowledgeSet;
+#use AI::Categorizer::Learner::NaiveBayes;
+use AI::Categorizer::Learner::KNN;
+#use AI::Categorizer::Learner::SVM;
+#use AI::Categorizer::Learner::DecisionTree;
+
+use Glib qw/TRUE FALSE/;
 use Glib::Object::Introspection;
+use Gtk3 -init;
 
 Glib::Object::Introspection->setup (basename => 'Poppler',
                                     version => '0.18',
                                     package => 'Poppler');
 
-my $training_dir = $ARGV[0];
-my $testing_dir = $ARGV[1];
+utf8::decode (my $training_dir = $ARGV[0]);
+utf8::decode (my $pdf_file = $ARGV[1]);
+#my @testing_files = @ARGV[1..$#ARGV];
 
-say 'Reading training set...';
+say 'Reading training dir...';
 my $training_collection = PDFCollection->new (path => $training_dir, recurse => 1);
 my $ks = AI::Categorizer::KnowledgeSet->new (verbose => 1);
 $ks->load (collection => $training_collection);
 
 say 'Training learner...';
-my $l = AI::Categorizer::Learner::NaiveBayes->new (verbose => 2);
-$l->train (knowledge_set => $ks);
+#my $learner = AI::Categorizer::Learner::NaiveBayes->new (verbose => 1);
+my $learner = AI::Categorizer::Learner::KNN->new (verbose => 1, k_value => 10, threshold => 0.01);
+#my $learner = AI::Categorizer::Learner::SVM->new (verbose => 1);
+#my $learner = AI::Categorizer::Learner::DecisionTree->new (verbose => 1);
+$learner->train (knowledge_set => $ks);
 
-say 'Categorizing test set';
-my $testing_collection = PDFCollection->new (path => $testing_dir, recurse => 1);
-my $experiment = $l->categorize_collection (collection => $testing_collection);
-print $experiment->stats_table;
+my $window = Gtk3::Window->new;
+my $box = Gtk3::VBox->new;
+
+my $button_box = Gtk3::HBox->new;
+my $button_extract = Gtk3::Button->new_with_label ('Extract');
+$button_box->add ($button_extract);
+
+my ($W, $H) = (500, 500*sqrt(2));
+
+my $model = Gtk3::ListStore->new (qw/Glib::String Gtk3::Gdk::Pixbuf/);
+my $pdf_doc = Poppler::Document->new_from_file (
+  Glib->filename_to_uri (File::Spec->rel2abs ($pdf_file), undef));
+foreach my $p (0 .. ($pdf_doc->get_n_pages ()-1)) {
+  my $page = $pdf_doc->get_page ($p);
+  my ($pw, $ph) = $page->get_size;
+  my ($aw, $ah) = ($W, $H);
+  my ($scale_w, $scale_h) = ($aw/$pw, $ah/$ph);
+  my $scale = min ($scale_w, $scale_h);
+
+  my $surface = Cairo::ImageSurface->create ('argb32', $aw, $ah);
+  my $cr = Cairo::Context->create ($surface);
+  $cr->scale ($scale, $scale);
+  $page->render ($cr);
+  my $pixbuf = Gtk3::Gdk::pixbuf_get_from_surface ($surface, 0, 0, $aw, $ah);
+  $model->set ($model->append (), 0 => "Page " . ($p+1), 1 => $pixbuf);
+}
+
+my $view = Gtk3::IconView->new_with_model ($model);
+$view->set_text_column (0);
+$view->set_pixbuf_column (1);
+$view->set_item_width ($W-175); # FIXME
+$view->set_selection_mode ('multiple');
+
+my $scroller = Gtk3::ScrolledWindow->new (undef, undef);
+$scroller->add ($view);
+
+$button_extract->signal_connect (clicked => sub {
+  my $selection = join ',', sort map { 1+$_->get_indices () }
+                                     @{$view->get_selected_items()};
+  my $extractor = PDF::Extract->new (PDFDoc => $pdf_file);
+  my $tmp_file = File::Temp::mktemp ('XXXXXXXX') . '.pdf';
+  $extractor->savePDFExtract (PDFSaveAs => $tmp_file, PDFPages => $selection);
+
+  my $tmp_doc = PDFDocument->read (path => $tmp_file);
+  my $experiment = $learner->categorize ($tmp_doc);
+  my @categories = $experiment->categories ();
+  my @dates = @{$tmp_doc->{_pdfai_dates}};
+
+  utf8::decode ($_) for @categories; # FIXME
+
+  my $dialog = Gtk3::Dialog->new_with_buttons (
+    'Choose date and category', $window, 'modal',
+    'OK' => 'accept', 'Cancel' => 'reject');
+  $dialog->set_default_response ('accept');
+
+  my $cb_date = Gtk3::ComboBoxText->new_with_entry ();
+  $cb_date->append (undef, $_) for @dates;
+  $cb_date->set_active (0);
+  $cb_date->get_child ()->set_activates_default (TRUE);
+
+  my $cb_cat = Gtk3::ComboBoxText->new_with_entry ();
+  $cb_cat->append (undef, $_) for @categories;
+  $cb_cat->set_active (0);
+  $cb_cat->get_child ()->set_activates_default (TRUE);
+
+  my $hbox = Gtk3::HBox->new ();
+  $hbox->pack_start ($cb_date, TRUE, TRUE, 0);
+  $hbox->pack_start ($cb_cat, TRUE, TRUE, 0);
+
+  $dialog->get_content_area ()->add ($hbox);
+  $dialog->show_all ();
+  if ('accept' eq $dialog->run ()) {
+    my $new_name = sprintf '%s %s.pdf', $cb_date->get_active_text (),
+                                        $cb_cat->get_active_text ();
+    if (! -e $new_name) {
+      rename $tmp_file, $new_name;
+    }
+  }
+  $dialog->destroy ();
+
+  unlink $tmp_file if -e $tmp_file;
+
+  return Gtk3::EVENT_STOP;
+});
+
+$box->pack_start ($scroller, TRUE, TRUE, 0);
+$box->pack_start ($button_box, FALSE, TRUE, 0);
+$window->add ($box);
+$window->signal_connect (delete_event => sub { Gtk3::main_quit () });
+$window->set_default_size (650, 990);
+$window->show_all;
+Gtk3::main ();
 
 # ---------------------------------------------------------------------------- #
 
@@ -35,6 +139,7 @@ package PDFDocument;
 use strict;
 use warnings;
 use base qw/AI::Categorizer::Document/;
+use File::Spec;
 
 sub read {
   my ($class, %args) = @_;
@@ -42,25 +147,56 @@ sub read {
 
   my $self = $class->new (%args);
 
-  my $doc = Poppler::Document->new_from_file (
-    Glib->filename_to_uri ($path, undef));
+  $path = File::Spec->rel2abs ($path);
+  my $uri = Glib->filename_to_uri ($path, undef);
+  my $doc = Poppler::Document->new_from_file ($uri);
 
   foreach my $p (0 .. ($doc->get_n_pages ()-1)) {
     my $page = $doc->get_page ($p);
     my $page_text = $page->get_text ();
-    utf8::encode ($page_text);
+    utf8::encode ($page_text); # FIXME
     $self->{content}{body} .= "$page_text\n\n";
+  }
+
+  $self->{_pdfai_dates} = [];
+  while ($self->{content}{body} =~ m/(\d\d?)\s*\.\s*(\d\d?)\s*\.\s*(\d\d\d\d)/g) {
+    my $d = zero_pad_dm ($1);
+    my $m = zero_pad_dm ($2);
+    push @{$self->{_pdfai_dates}}, "$3-$m-$d";
+  }
+
+  my @months = qw/Januar Februar März April Mai Juni Juli August September Oktober November Dezember/;
+  my $months_pattern = join '|', @months;
+  my %months_numbers = map { $months[$_] => zero_pad_dm ($_+1) } 0..$#months;
+  while ($self->{content}{body} =~ m/(\d\d?)\s*\.?\s*($months_pattern)\s*(\d\d\d\d)/g) {
+    my $d = zero_pad_dm ($1);
+    my $m = $months_numbers{$2};
+    push @{$self->{_pdfai_dates}}, "$3-$m-$d";
+  }
+
+  my @months_short = map { substr $_, 0, 3 } @months;
+  my $months_short_pattern = join '|', @months_short;
+  my %months_short_numbers = map { $months_short[$_] => zero_pad_dm ($_+1) } 0..$#months_short;
+  while ($self->{content}{body} =~ m/(\d\d?)\s*\.?\s*($months_short_pattern)\s*(\d\d\d\d)/g) {
+    my $d = zero_pad_dm ($1);
+    my $m = $months_short_numbers{$2};
+    push @{$self->{_pdfai_dates}}, "$3-$m-$d";
   }
 
   $self->finish;
   return $self;
 }
 
+sub zero_pad_dm {
+  return sprintf '%02d', shift;
+}
+
 package PDFCollection;
 
 use strict;
 use warnings;
-use File::Basename qw//;
+use File::Basename qw/basename/;
+use File::Spec;
 use base qw/AI::Categorizer::Collection::Files/;
 
 # FIXME
@@ -74,10 +210,11 @@ sub next {
   my $self = shift;
   my $file = $self->_read_file;
   return unless defined $file;
+  return unless $file =~ /\.pdf$/i;
 
   my $cats = [];
-  my $basename = File::Basename::basename ($file);
-  if ($basename =~ m/^\d\d\d\d-\d\d-\d\d ([^.]+)\.pdf/i) {
+  my $basename = basename ($file);
+  if ($basename =~ m/^\d\d\d\d-\d\d-\d\d ([^.]+)\.pdf$/i) {
     push @$cats, AI::Categorizer::Category->by_name (name => $1);
   }
 
