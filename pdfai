@@ -23,9 +23,11 @@ Glib::Object::Introspection->setup (basename => 'Poppler',
                                     version => '0.18',
                                     package => 'Poppler');
 
+if (@ARGV != 2) {
+  die "Usage: pdfai <training dir> <pdf file>\n";
+}
 utf8::decode (my $training_dir = $ARGV[0]);
 utf8::decode (my $pdf_file = $ARGV[1]);
-#my @testing_files = @ARGV[1..$#ARGV];
 
 say 'Reading training dir...';
 my $training_collection = PDFCollection->new (path => $training_dir, recurse => 1);
