@@ -1,0 +1,5 @@
+pdfai
+-----
+
+Small Perl tool that uses AI::Categorizer and a small Gtk3 GUI to categorize
+pages of a PDF file into learned categories.
